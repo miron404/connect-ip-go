@@ -1,9 +1,9 @@
-module github.com/Diniboy1123/connect-ip-go/integration
+module github.com/miron404/connect-ip-go/integration
 
 go 1.23
 
 require (
-	github.com/Diniboy1123/connect-ip-go v0.0.0-20250220050656-56698ca53ed4
+	github.com/miron404/connect-ip-go v0.0.0-20250220050656-56698ca53ed4
 	github.com/quic-go/quic-go v0.48.0
 	github.com/songgao/water v0.0.0-20200317203138-2b4b6d7c09d8
 	github.com/stretchr/testify v1.9.0
@@ -33,3 +33,5 @@ require (
 	gopkg.in/check.v1 v1.0.0-20201130134442-10cb98267c6c // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 )
+
+replace github.com/miron404/connect-ip-go => ../

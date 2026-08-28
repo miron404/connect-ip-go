@@ -11,7 +11,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/Diniboy1123/connect-ip-go/integration/internal/utils"
+	"github.com/miron404/connect-ip-go/integration/internal/utils"
 )
 
 func runPingTest(dst netip.Addr, num int) error {

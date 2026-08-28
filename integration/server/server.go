@@ -8,7 +8,7 @@ import (
 	"path"
 	"strconv"
 
-	"github.com/Diniboy1123/connect-ip-go/integration/internal/utils"
+	"github.com/miron404/connect-ip-go/integration/internal/utils"
 
 	"github.com/quic-go/quic-go"
 	"github.com/quic-go/quic-go/http3"
