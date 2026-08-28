@@ -54,6 +54,8 @@ var (
 // If a packet is too large to fit into a QUIC datagram,
 // we send an ICMP Packet Too Big packet.
 // On IPv6, the minimum MTU of a link is 1280 bytes.
+// minMTU is only a fallback for a peer that reports a nonsensical datagram
+// limit; the real limit is taken from the error itself.
 const minMTU = 1280
 
 // Conn is a connection that proxies IP packets over HTTP/3.
@@ -422,7 +424,15 @@ func (c *Conn) sendComposedDatagram(data, packet []byte) (icmp []byte, err error
 	if err := c.str.SendDatagram(data); err != nil {
 		var errDTL *quic.DatagramTooLargeError
 		if errors.As(err, &errDTL) {
-			icmpPacket, err := composeICMPTooLargePacket(packet, minMTU)
+			// Report the MTU that actually fits. Announcing a constant leaves a
+			// sender that is already at that value with nothing to shrink to,
+			// so it keeps retransmitting the same oversized packet forever
+			// while small ones still get through.
+			mtu := int(errDTL.MaxDatagramPayloadSize) - len(contextIDZero)
+			if mtu <= 0 {
+				mtu = minMTU
+			}
+			icmpPacket, err := composeICMPTooLargePacket(packet, mtu)
 			if err != nil {
 				log.Printf("failed to compose ICMP too large packet: %s", err)
 			}
