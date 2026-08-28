@@ -207,9 +207,9 @@ func (c *Conn) Routes(ctx context.Context) ([]IPRoute, error) {
 
 func (c *Conn) readFromStream() error {
 	defer c.str.Close()
-	r := quicvarint.NewReader(c.str)
+	cp := http3.NewCapsuleParser(c.str)
 	for {
-		t, cr, err := http3.ParseCapsule(r)
+		t, cr, err := cp.Next()
 		if err != nil {
 			return err
 		}
