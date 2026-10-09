@@ -29,11 +29,10 @@ func DialH2(ctx context.Context, client *http.Client, template *uritemplate.Temp
 		return nil, nil, fmt.Errorf("connect-ip: failed to parse URI: %w", err)
 	}
 
-	pr, pw := io.Pipe()
-	req, err := http.NewRequestWithContext(ctx, http.MethodConnect, u.String(), pr)
+	body := newH2RequestBody()
+	req, err := http.NewRequestWithContext(ctx, http.MethodConnect, u.String(), body)
 	if err != nil {
-		_ = pr.Close()
-		_ = pw.Close()
+		_ = body.Close()
 		return nil, nil, fmt.Errorf("connect-ip: failed to create request: %w", err)
 	}
 	req.Host = authorityFromURL(u)
@@ -45,21 +44,18 @@ func DialH2(ctx context.Context, client *http.Client, template *uritemplate.Temp
 
 	rsp, err := client.Do(req)
 	if err != nil {
-		_ = pr.Close()
-		_ = pw.Close()
+		_ = body.Close()
 		return nil, nil, fmt.Errorf("connect-ip: failed to send request: %w", err)
 	}
 	if rsp.StatusCode < 200 || rsp.StatusCode > 299 {
-		_ = pr.Close()
-		_ = pw.Close()
+		_ = body.Close()
 		_ = rsp.Body.Close()
 		return nil, rsp, fmt.Errorf("connect-ip: server responded with %d", rsp.StatusCode)
 	}
 
 	stream := &h2DatagramStream{
-		requestBody:  pw,
+		requestBody:  body,
 		responseBody: rsp.Body,
-		recvBuf:      make([]byte, 0, 4096),
 	}
 	return newDatagramOnlyConn(stream), rsp, nil
 }
@@ -76,42 +72,67 @@ func authorityFromURL(u *url.URL) string {
 }
 
 type h2DatagramStream struct {
-	requestBody  *io.PipeWriter
+	requestBody  *h2RequestBody
 	responseBody io.ReadCloser
 
-	readMu  sync.Mutex
-	writeMu sync.Mutex
-	recvBuf []byte
+	readMu sync.Mutex
+	// recvBuf[recvStart:recvEnd] is what has been read and not yet parsed.
+	recvBuf            []byte
+	recvStart, recvEnd int
 }
 
+// h2ReceiveBufferSize holds a whole HTTP/2 DATA frame at the default frame
+// size, so a frame carrying several capsules is taken in one read.
+const h2ReceiveBufferSize = 16 << 10
+
+// ReceiveDatagram returns the next datagram, backed by the receive buffer. It
+// is valid until the next call, as ReadPacketZeroCopy documents.
 func (s *h2DatagramStream) ReceiveDatagram(_ context.Context) ([]byte, error) {
 	s.readMu.Lock()
 	defer s.readMu.Unlock()
 
+	if s.recvBuf == nil {
+		s.recvBuf = make([]byte, h2ReceiveBufferSize)
+	}
 	for {
-		capsuleType, payload, consumed, ok, err := parseCapsule(s.recvBuf)
+		pending := s.recvBuf[s.recvStart:s.recvEnd]
+		capsuleType, payload, consumed, ok, err := parseCapsule(pending)
 		if err != nil {
 			return nil, err
 		}
 		if ok {
+			s.recvStart += consumed
 			if capsuleType != h2DatagramCapsuleType {
-				s.recvBuf = s.recvBuf[consumed:]
 				continue
 			}
 			payloadOffset := consumed - len(payload)
 			if payloadOffset < len(contextIDZero) {
 				return nil, errors.New("connect-ip: malformed datagram capsule")
 			}
-			copy(s.recvBuf[payloadOffset-len(contextIDZero):payloadOffset], contextIDZero)
-			data := s.recvBuf[payloadOffset-len(contextIDZero) : consumed]
-			s.recvBuf = s.recvBuf[consumed:]
-			return data, nil
+			// The capsule header in front of the payload is overwritten
+			// with the context ID, so the datagram needs no copy.
+			copy(pending[payloadOffset-len(contextIDZero):payloadOffset], contextIDZero)
+			return pending[payloadOffset-len(contextIDZero) : consumed], nil
 		}
 
-		buf := make([]byte, 4096)
-		n, readErr := s.responseBody.Read(buf)
+		// Read straight into the buffer rather than through a fresh one per
+		// call. Once the end is reached, the partial capsule left over moves
+		// to the front, which may overwrite the datagram returned last time;
+		// the caller is done with it by now. Only a capsule larger than the
+		// whole buffer makes it grow.
+		if s.recvEnd == len(s.recvBuf) {
+			if s.recvStart == 0 {
+				grown := make([]byte, 2*len(s.recvBuf))
+				copy(grown, s.recvBuf)
+				s.recvBuf = grown
+			} else {
+				s.recvEnd = copy(s.recvBuf, pending)
+				s.recvStart = 0
+			}
+		}
+		n, readErr := s.responseBody.Read(s.recvBuf[s.recvEnd:])
+		s.recvEnd += n
 		if n > 0 {
-			s.recvBuf = append(s.recvBuf, buf[:n]...)
 			continue
 		}
 		if readErr != nil {
@@ -128,16 +149,7 @@ func (s *h2DatagramStream) SendDatagram(data []byte) error {
 	if contextID != 0 {
 		return fmt.Errorf("connect-ip: unsupported datagram context ID: %d", contextID)
 	}
-
-	frame := make([]byte, 0, 2*quicvarint.Len(0)+len(data[n:]))
-	frame = quicvarint.Append(frame, h2DatagramCapsuleType)
-	frame = quicvarint.Append(frame, uint64(len(data[n:])))
-	frame = append(frame, data[n:]...)
-
-	s.writeMu.Lock()
-	defer s.writeMu.Unlock()
-	_, err = s.requestBody.Write(frame)
-	if err != nil {
+	if err := s.requestBody.writeCapsule(h2DatagramCapsuleType, data[n:]); err != nil {
 		return fmt.Errorf("connect-ip: failed to send datagram capsule: %w", err)
 	}
 	return nil
@@ -154,7 +166,7 @@ func (s *h2DatagramStream) Write(_ []byte) (int, error) {
 }
 
 func (s *h2DatagramStream) Close() error {
-	_ = s.requestBody.Close()
+	s.requestBody.closeWrite()
 	return s.responseBody.Close()
 }
 
